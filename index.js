@@ -52,7 +52,7 @@ app.use(
       "https://stacksapp.pages.dev",
       "http://localhost:5173",
       "https://stacksapp-frontend.onrender.com",
-      "https://digitalblitz.onrender.com",
+      "https://earthbound-z4va.onrender.com",
     ],
     credentials: true,
     allowedHeaders: [
