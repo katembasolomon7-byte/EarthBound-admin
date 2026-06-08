@@ -47,8 +47,8 @@ app.use(
   cors({
     origin: [
       "https://stackswork.netlify.app",
-      "https://stacksl.com",
-      "https://www.stacksl.com",
+      "https://earthboundtco.com",
+      "https://www.earthboundtco.com",
       "https://stacksapp.pages.dev",
       "http://localhost:5173",
       "https://stacksapp-frontend.onrender.com",
