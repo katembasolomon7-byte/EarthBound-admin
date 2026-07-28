@@ -1,3 +1,4 @@
+// (updated) admin (12).js
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -591,10 +592,117 @@ router.post('/settings', asyncHandler(async (req, res) => {
 }));
 
 // ===================== USERS API (RESTful) ===================== //
-router.get('/users', asyncHandler(async (_, res) => {
-    const users = await User.find({}).lean();
-    res.json(users);
+// NOTE: This endpoint supports server-side pagination, search (q), and newest-first sorting.
+// Query params:
+//  - q (optional): search term (matches username and phone, case-insensitive substring)
+//  - page (optional, default 1)
+//  - limit (optional, default 200, max 1000)
+//  - sort (optional): 'newest' (default) or 'oldest'
+router.get('/users', asyncHandler(async (req, res) => {
+    // Parse pagination & search params
+    let page = parseInt(req.query.page, 10);
+    if (isNaN(page) || page < 1) page = 1;
+    let limit = parseInt(req.query.limit, 10);
+    if (isNaN(limit) || limit < 1) limit = 200;
+    const MAX_LIMIT = 1000;
+    if (limit > MAX_LIMIT) limit = MAX_LIMIT;
+
+    const q = (req.query.q || '').toString().trim();
+    const sortParam = (req.query.sort || 'newest').toString().toLowerCase();
+
+    // Build Mongo query
+    const query = {};
+    if (q) {
+        const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        query.$or = [
+            { username: { $regex: regex } },
+            { phone: { $regex: regex } }
+        ];
+    }
+
+    // Sorting: prefer createdAt if available, otherwise _id
+    const sort = {};
+    if (sortParam === 'oldest') {
+        // oldest first
+        if (User.schema && User.schema.paths && User.schema.paths.createdAt) {
+            sort.createdAt = 1;
+        } else {
+            sort._id = 1;
+        }
+    } else {
+        // newest first (default)
+        if (User.schema && User.schema.paths && User.schema.paths.createdAt) {
+            sort.createdAt = -1;
+        } else {
+            sort._id = -1;
+        }
+    }
+
+    // Projection: return a listing-friendly subset to keep payload small
+    const projection = {
+        username: 1,
+        phone: 1,
+        vipLevel: 1,
+        balance: 1,
+        status: 1,
+        currentSet: 1,
+        exchange: 1,
+        walletAddress: 1,
+        creditScore: 1,
+        createdAt: 1,
+        inviteCode: 1,
+        referredBy: 1,
+        token: 1
+    };
+
+    // Execute count and fetch in parallel
+    const [total, users] = await Promise.all([
+        User.countDocuments(query).exec(),
+        User.find(query, projection)
+            .sort(sort)
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .lean()
+            .exec()
+    ]);
+
+    res.json({
+        users: users || [],
+        page,
+        limit,
+        total: typeof total === 'number' ? total : 0
+    });
 }));
+
+// Lightweight summary endpoint for autocomplete / appbar search
+// GET /admin/users/summary?q=<term>&limit=30
+router.get('/users/summary', asyncHandler(async (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  let limit = parseInt(req.query.limit, 10);
+  if (isNaN(limit) || limit < 1) limit = 30;
+  const MAX = 200;
+  if (limit > MAX) limit = MAX;
+
+  const query = {};
+  if (q) {
+    const esc = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(esc, 'i');
+    query.$or = [
+      { username: { $regex: regex } },
+      { phone: { $regex: regex } }
+    ];
+  }
+
+  // Return minimal projection to keep payload tiny
+  const users = await User.find(query, { username: 1, balance: 1 })
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(limit)
+    .lean()
+    .exec();
+
+  res.json({ users });
+}));
+
 router.post('/users', asyncHandler(async (req, res) => {
     // Debug log incoming payload for visibility
     try { console.log('POST /admin/users payload:', JSON.stringify(req.body).slice(0, 2000)); } catch (e) { /* ignore */ }
@@ -723,6 +831,240 @@ router.post('/vip/bulk-downgrade', asyncHandler(async (req, res) => {
     res.json({ success: true, changed });
 }));
 
+// ===================== Paginated / Filtered endpoints for large collections ===================== //
+
+// Paginated, filterable transactions endpoint
+// GET /admin/transactions?username=foo&type=admin_add_balance&page=1&limit=50
+router.get('/transactions', asyncHandler(async (req, res) => {
+  const { username, type } = req.query;
+  let page = Math.max(1, parseInt(req.query.page || '1', 10));
+  let limit = Math.min(1000, Math.max(1, parseInt(req.query.limit || '50', 10)));
+
+  const q = {};
+  if (username) q.$or = [{ username }, { user: username }];
+  if (type) q.type = { $regex: new RegExp(String(type), 'i') };
+
+  const [total, items] = await Promise.all([
+    Transaction.countDocuments(q),
+    Transaction.find(q)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({ items, total, page, limit });
+}));
+
+// Paginated combos endpoint
+// GET /admin/combos?username=foo&page=1&limit=50
+router.get('/combos', asyncHandler(async (req, res) => {
+  const { username } = req.query;
+  let page = Math.max(1, parseInt(req.query.page || '1', 10));
+  let limit = Math.min(500, Math.max(1, parseInt(req.query.limit || '50', 10)));
+
+  const q = {};
+  if (username) q.username = username;
+
+  const [total, items] = await Promise.all([
+    Combo.countDocuments(q),
+    Combo.find(q)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({ items, total, page, limit });
+}));
+
+// New/Restored combo CRUD endpoints (compatibility with original admin UI)
+// Create combo (primary endpoint used by UI)
+router.post('/combos', asyncHandler(async (req, res) => {
+  const { username, triggerTaskNumber, products } = req.body || {};
+  if (!username || !triggerTaskNumber || !Array.isArray(products) || products.length === 0) {
+    return res.status(400).json({ success: false, message: 'All fields required and at least one product.' });
+  }
+  const combo = {
+    username,
+    triggerTaskNumber,
+    products,
+    createdAt: new Date().toISOString()
+  };
+  const created = await Combo.create(combo);
+  await Log.create({
+    action: 'Combo Assigned (API)',
+    username,
+    combo: { triggerTaskNumber, products },
+    timestamp: new Date().toISOString()
+  }).catch(() => {});
+  res.json({ success: true, combo: created });
+}));
+
+// Get single combo by id
+router.get('/combos/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid combo id' });
+  let combo = null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    combo = await Combo.findById(id).lean();
+  }
+  if (!combo) {
+    combo = await Combo.findOne({ $or: [{ id }, { _id: id }] }).lean();
+  }
+  if (!combo) return res.status(404).json({ success: false, message: 'Combo not found' });
+  res.json({ success: true, combo });
+}));
+
+// Update combo
+router.put('/combos/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body || {};
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid combo id' });
+
+  let updated = null;
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    updated = await Combo.findByIdAndUpdate(id, updates, { new: true }).lean();
+  }
+  if (!updated) {
+    updated = await Combo.findOneAndUpdate({ id }, updates, { new: true }).lean();
+  }
+  if (!updated) return res.status(404).json({ success: false, message: 'Combo not found' });
+  res.json({ success: true, combo: updated });
+}));
+
+// Delete combo (path param)
+router.delete('/combos/:id', asyncHandler(async (req, res) => {
+  let { id } = req.params;
+  if (!id) return res.status(400).json({ success: false, message: 'Invalid combo id' });
+
+  try {
+    let result = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      result = await Combo.deleteOne({ _id: id });
+    } else {
+      // try deletion by string _id or legacy id field
+      result = await Combo.deleteOne({ _id: id });
+      if (!result || result.deletedCount === 0) {
+        result = await Combo.deleteOne({ id });
+      }
+    }
+
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: 'Combo not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /admin/combos/:id error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+}));
+
+// Fallback delete that accepts query param or JSON body
+router.delete('/combos', asyncHandler(async (req, res) => {
+  const id = req.query.id || (req.body && (req.body.id || req.body._id));
+  if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
+  try {
+    let result = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      result = await Combo.deleteOne({ _id: id });
+    }
+    if (!result || result.deletedCount === 0) {
+      result = await Combo.deleteOne({ id });
+    }
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: 'Combo not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /admin/combos (fallback) error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+}));
+
+// Extra fallback POST endpoint commonly tried by legacy clients
+router.post('/combos/delete', asyncHandler(async (req, res) => {
+  const id = req.body && (req.body.id || req.body._id);
+  if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
+  try {
+    let result = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      result = await Combo.deleteOne({ _id: id });
+    }
+    if (!result || result.deletedCount === 0) {
+      result = await Combo.deleteOne({ id });
+    }
+    if (!result || result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: 'Combo not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /admin/combos/delete error:', err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+}));
+
+// Paginated withdrawals endpoint
+// GET /admin/withdrawals?username=foo&status=Pending&page=1&limit=50
+router.get('/withdrawals', asyncHandler(async (req, res) => {
+  const { username, status } = req.query;
+  let page = Math.max(1, parseInt(req.query.page || '1', 10));
+  let limit = Math.min(500, Math.max(1, parseInt(req.query.limit || '50', 10)));
+
+  const q = {};
+  if (username) q.$or = [{ username }, { user: username }];
+  if (status) q.status = status;
+
+  const [total, items] = await Promise.all([
+    Withdrawal.countDocuments(q),
+    Withdrawal.find(q)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({ items, total, page, limit });
+}));
+
+// ===================== ADDED: Paginated tasks endpoint ===================== //
+// GET /admin/tasks?page=1&limit=50&username=...&status=...&q=search
+router.get('/tasks', asyncHandler(async (req, res) => {
+  const { username, status } = req.query;
+  let page = Math.max(1, parseInt(req.query.page || '1', 10));
+  let limit = Math.min(1000, Math.max(1, parseInt(req.query.limit || '50', 10)));
+  const search = (req.query.q || '').toString().trim();
+
+  const q = {};
+  if (username) q.$or = [{ username }, { user: username }];
+  if (status) q.status = status;
+
+  if (search) {
+    const esc = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(esc, 'i');
+    q.$or = q.$or || [];
+    q.$or.push(
+      { name: { $regex: regex } },
+      { 'product.name': { $regex: regex } },
+      { username: { $regex: regex } },
+      { user: { $regex: regex } }
+    );
+  }
+
+  const [total, items] = await Promise.all([
+    Task.countDocuments(q),
+    Task.find(q)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean()
+  ]);
+
+  res.json({ items, total, page, limit });
+}));
+
+// (Other product/task/notification endpoints remain unchanged but are kept below for completeness.)
+
 router.get('/products', asyncHandler(async (_, res) => {
     const products = await Product.find({}).lean();
     res.json(products);
@@ -770,59 +1112,6 @@ router.get('/products/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, product });
 }));
 
-router.get('/combos', asyncHandler(async (_, res) => {
-    const combos = await Combo.find({}).lean();
-    res.json(combos);
-}));
-router.post('/combos', asyncHandler(async (req, res) => {
-    const { username, triggerTaskNumber, products } = req.body;
-    if (!username || !triggerTaskNumber || !products || !Array.isArray(products) || products.length === 0)
-        return res.status(400).json({ success: false, message: 'All fields required and at least one product.' });
-    const combo = {
-        username,
-        triggerTaskNumber,
-        products
-    };
-    await Combo.create(combo);
-    res.json({ success: true, combo });
-}));
-router.put('/combos/:id', asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-        return res.status(400).json({ success: false, message: 'Invalid combo id' });
-    }
-    const { username, triggerTaskNumber, products } = req.body;
-    const combo = await Combo.findById(id);
-    if (!combo) return res.status(404).json({ success: false, message: 'Combo not found' });
-    if (username) combo.username = username;
-    if (triggerTaskNumber) combo.triggerTaskNumber = triggerTaskNumber;
-    if (products && Array.isArray(products)) combo.products = products;
-    await combo.save();
-    res.json({ success: true, combo });
-}));
-router.delete('/combos/:id', asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-        return res.status(400).json({ success: false, message: 'Invalid combo id' });
-    }
-    const result = await Combo.deleteOne({ _id: id });
-    if (result.deletedCount === 0) return res.status(404).json({ success: false, message: 'Combo not found' });
-    res.json({ success: true });
-}));
-router.get('/combos/:id', asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-        return res.status(400).json({ success: false, message: 'Invalid combo id' });
-    }
-    const combo = await Combo.findById(id).lean();
-    if (!combo) return res.status(404).json({ success: false, message: 'Combo not found' });
-    res.json({ success: true, combo });
-}));
-
-router.get('/tasks', asyncHandler(async (_, res) => {
-    const tasks = await Task.find({}).lean();
-    res.json(tasks);
-}));
 router.post('/tasks', asyncHandler(async (req, res) => {
     const { user, name, status } = req.body;
     if (!user || !name) return res.status(400).json({ success: false, message: 'User and Task Name are required' });
@@ -862,11 +1151,6 @@ router.get('/tasks/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, task });
 }));
 
-router.get('/transactions', asyncHandler(async (_, res) => {
-    const deposits = await Transaction.find({}).lean();
-    const withdrawals = await Withdrawal.find({}).lean();
-    res.json({ deposits, withdrawals });
-}));
 router.put('/transactions/:id', asyncHandler(async (req, res) => {
     const { id } = req.params;
     const updates = req.body;
@@ -887,10 +1171,6 @@ router.get('/transactions/:id', asyncHandler(async (req, res) => {
     res.json({ success: true, transaction: txn });
 }));
 
-router.get('/withdrawals', asyncHandler(async (_, res) => {
-    const withdrawals = await Withdrawal.find({}).lean();
-    res.json(withdrawals);
-}));
 router.put('/withdrawals/:id', asyncHandler(async (req, res) => {
     const { id } = req.params;
     const updates = req.body;
@@ -1042,7 +1322,8 @@ router.post('/assign-combo', asyncHandler(async (req, res) => {
     await Combo.create({
         username,
         triggerTaskNumber,
-        products
+        products,
+        createdAt: new Date().toISOString()
     });
 
     await Log.create({
